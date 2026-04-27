@@ -3024,6 +3024,11 @@ var src_default = {
     }
     const newUrl = replacedURIs.join("|");
     url.searchParams.set("url", newUrl);
+
+    // 只新增这一处识别：如果本次请求要生成 clash / sing-box 配置，
+    // 后端返回后就在“恢复真实节点信息”之后再处理 APPEND 块。
+    const configType = detectConfigType(url);
+
     const modifiedRequest = new Request(backend + url.pathname + url.search, request);
     const rpResponse = await fetch(modifiedRequest);
     for (const key of keys) {
@@ -3043,10 +3048,9 @@ var src_default = {
         const replacedBase64Data = btoa(newLinks.join("\r\n"));
         return new Response(replacedBase64Data, rpResponse);
       } catch (base64Error) {
-        const result = plaintextData.replace(
-          new RegExp(Object.keys(replacements).join("|"), "g"),
-          (match) => replacements[match] || match
-        );
+        // 不是 base64 时，保留原有“恢复真实节点信息”的逻辑，
+        // 然后仅在 clash / sing-box 请求里尝试追加配置。
+        const result = restoreAndAppendConfig(plaintextData, replacements, configType, env);
         return new Response(result, rpResponse);
       }
     }
@@ -3244,6 +3248,215 @@ function replaceYAML(yamlObj, replacements) {
     }
   });
   return yaml.dump(yamlObj);
+}
+
+// 先按原逻辑把随机值恢复成真实值。
+// 只有在目标是 clash / sing-box 时，才继续尝试合并 APPEND 配置。
+function restoreAndAppendConfig(plaintextData, replacements, configType, env) {
+  const restoredText = restorePlaintextData(plaintextData, replacements);
+  if (!configType) {
+    return restoredText;
+  }
+  return appendConfigBlock(restoredText, configType, env);
+}
+
+function restorePlaintextData(plaintextData, replacements) {
+  const replacementKeys = Object.keys(replacements);
+  if (replacementKeys.length === 0) {
+    return plaintextData;
+  }
+  return plaintextData.replace(
+    new RegExp(replacementKeys.join("|"), "g"),
+    (match) => replacements[match] || match
+  );
+}
+
+// 通过常见后端参数识别目标配置类型。
+function detectConfigType(url) {
+  const target = (url.searchParams.get("target") || url.searchParams.get("format") || "").toLowerCase();
+  if (target.includes("sing-box") || target.includes("singbox")) {
+    return "singbox";
+  }
+  if (target.includes("clash")) {
+    return "clash";
+  }
+  return null;
+}
+
+// 统一入口：
+// - clash 读取 CLASH_APPEND
+// - sing-box 读取 SINGBOX_APPEND
+// 任何解析、合并、校验错误都直接回退到后端原配置，
+// 同时在 Worker 日志里打印错误，避免已有业务逻辑被破坏。
+function appendConfigBlock(configText, configType, env) {
+  if (configType === "clash") {
+    return safelyApplyClashAppend(configText, env.CLASH_APPEND);
+  }
+  if (configType === "singbox") {
+    return safelyApplySingboxAppend(configText, env.SINGBOX_APPEND);
+  }
+  return configText;
+}
+
+function safelyApplyClashAppend(configText, appendText) {
+  if (!appendText || !appendText.trim()) {
+    return configText;
+  }
+
+  let baseConfig;
+  try {
+    baseConfig = yaml.load(configText);
+  } catch (error) {
+    return configText;
+  }
+  if (!isPlainObject(baseConfig)) {
+    return configText;
+  }
+
+  let appendConfig;
+  try {
+    appendConfig = yaml.load(appendText);
+  } catch (error) {
+    console.error("Invalid CLASH_APPEND YAML:", error);
+    return configText;
+  }
+  if (!isPlainObject(appendConfig)) {
+    console.error("Invalid CLASH_APPEND YAML: root value must be a mapping");
+    return configText;
+  }
+
+  try {
+    const mergedConfig = mergeClashConfig(baseConfig, appendConfig);
+    const renderedText = yaml.dump(mergedConfig, {
+      lineWidth: -1,
+      noRefs: true
+    });
+
+    // 再解析一次，确保最终返回给客户端的是合法 YAML。
+    yaml.load(renderedText);
+    return renderedText;
+  } catch (error) {
+    console.error("Failed to apply CLASH_APPEND:", error);
+    return configText;
+  }
+}
+
+function safelyApplySingboxAppend(configText, appendText) {
+  if (!appendText || !appendText.trim()) {
+    return configText;
+  }
+
+  let baseConfig;
+  try {
+    baseConfig = JSON.parse(configText);
+  } catch (error) {
+    return configText;
+  }
+  if (!isPlainObject(baseConfig)) {
+    return configText;
+  }
+
+  let appendConfig;
+  try {
+    appendConfig = JSON.parse(appendText);
+  } catch (error) {
+    console.error("Invalid SINGBOX_APPEND JSON:", error);
+    return configText;
+  }
+  if (!isPlainObject(appendConfig)) {
+    console.error("Invalid SINGBOX_APPEND JSON: root value must be an object");
+    return configText;
+  }
+
+  try {
+    const mergedConfig = mergeSingboxConfig(baseConfig, appendConfig);
+    const renderedText = JSON.stringify(mergedConfig, null, 2);
+
+    // 再解析一次，确保最终返回给客户端的是合法 JSON。
+    JSON.parse(renderedText);
+    return renderedText;
+  } catch (error) {
+    console.error("Failed to apply SINGBOX_APPEND:", error);
+    return configText;
+  }
+}
+
+// Clash 合并规则：
+// - append 里出现的普通顶层块，直接整块替换后端同名块
+// - rules 例外：append.rules 放前面，后端 rules 放后面
+// - append 中新增/覆盖的块排在结果前部，方便把高优先级内容放前面
+function mergeClashConfig(baseConfig, appendConfig) {
+  return buildOrderedObject(baseConfig, appendConfig, (key, baseValue, appendValue) => {
+    if (key === "rules") {
+      return mergeRuleArrays(baseValue, appendValue, "clash rules");
+    }
+    return cloneValue(appendValue);
+  });
+}
+
+// sing-box 合并规则：
+// - append 里出现的普通顶层块，直接整块替换后端同名块
+// - route 单独处理，因为只有 route.rules 需要做前置合并
+function mergeSingboxConfig(baseConfig, appendConfig) {
+  return buildOrderedObject(baseConfig, appendConfig, (key, baseValue, appendValue) => {
+    if (key === "route" && isPlainObject(appendValue)) {
+      return mergeSingboxRoute(baseValue, appendValue);
+    }
+    return cloneValue(appendValue);
+  });
+}
+
+function mergeSingboxRoute(baseRoute, appendRoute) {
+  const safeBaseRoute = isPlainObject(baseRoute) ? baseRoute : {};
+  return buildOrderedObject(safeBaseRoute, appendRoute, (key, baseValue, appendValue) => {
+    if (key === "rules") {
+      return mergeRuleArrays(baseValue, appendValue, "sing-box route.rules");
+    }
+    return cloneValue(appendValue);
+  });
+}
+
+// 构造一个“append 在前、base 在后”的对象，
+// 这样 append 新增的块会放在最终配置的前面。
+function buildOrderedObject(baseObject, appendObject, resolveValue) {
+  const result = {};
+  for (const [key, appendValue] of Object.entries(appendObject)) {
+    const baseValue = baseObject ? baseObject[key] : void 0;
+    result[key] = resolveValue(key, baseValue, appendValue);
+  }
+  for (const [key, baseValue] of Object.entries(baseObject || {})) {
+    if (!(key in appendObject)) {
+      result[key] = cloneValue(baseValue);
+    }
+  }
+  return result;
+}
+
+// 分流规则一律前置合并，让 append 中的规则拥有最高优先级。
+function mergeRuleArrays(baseRules, appendRules, label) {
+  if (!Array.isArray(appendRules)) {
+    throw new Error(label + " must be an array");
+  }
+  const safeBaseRules = Array.isArray(baseRules) ? baseRules : [];
+  return [...cloneValue(appendRules), ...cloneValue(safeBaseRules)];
+}
+
+function cloneValue(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => cloneValue(item));
+  }
+  if (isPlainObject(value)) {
+    const cloned = {};
+    for (const [key, childValue] of Object.entries(value)) {
+      cloned[key] = cloneValue(childValue);
+    }
+    return cloned;
+  }
+  return value;
+}
+
+function isPlainObject(value) {
+  return Object.prototype.toString.call(value) === "[object Object]";
 }
 function urlSafeBase64Encode(input) {
   return btoa(input).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
